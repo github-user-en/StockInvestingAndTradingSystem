@@ -1,0 +1,220 @@
+//@version=5
+strategy("Composite Volume Profile Strategy (Typed NA fixes + 10% long filter)", overlay=true, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.01, calc_on_every_tick=false, pyramiding=0, process_orders_on_close=true, max_lines_count=500, max_labels_count=500)
+
+// ====================== Inputs ======================
+lookbackBars       = input.int(200, "Composite Lookback (bars)", minval=50, maxval=1500)
+bins               = input.int(24, "Price Bins", minval=8, maxval=100)
+minBandPct         = input.float(0.6, "LVN Volume Threshold (as % of avg bin vol)", minval=0.2, maxval=1.0, step=0.05)
+volFilterLen       = input.int(20, "Volume Filter SMA", minval=1)
+tradeSide          = input.string("Both", "Direction", options=["Both","Long Only","Short Only"])
+useSession         = input.bool(false, "Rebuild only on Session (RTH)")
+sessionStr         = input.session("0930-1600", "Session (exchange time)")
+riskPerTrade       = input.float(1.0, "Risk per Trade (% of equity)", minval=0.1, maxval=5.0)
+tpRR               = input.float(2.0, "Take Profit R:R", minval=0.5, step=0.5)
+slBufferTicks      = input.int(0, "POC Stop Buffer (ticks)", minval=0)
+useATRtrail        = input.bool(false, "Use ATR Trail After Break-even?")
+atrLen             = input.int(14, "ATR Length", minval=1)
+atrMult            = input.float(2.0, "ATR Multiplier", minval=0.1, step=0.1)
+profitThresholdPct = input.float(10.0, "Min Profit % for Longs", minval=0.1, maxval=100.0, step=0.1)
+
+showProfileLines = input.bool(true, "Show Lines: POC & LVNs")
+clrPOC           = color.new(color.orange, 0)
+clrLVN           = color.new(color.aqua, 0)
+clrBand          = color.new(color.gray, 85)
+
+// ====================== Globals ======================
+inSess = useSession ? time(timeframe.period, sessionStr) != 0 : true
+
+var float lastCompositeKey = na
+var float compLo = na
+var float compHi = na
+var float binStep = na
+var int   binsUsed = 0
+
+// arrays to hold histogram
+var volBins = array.new_float()
+var priceBins = array.new_float()
+
+// Reset arrays to a given size
+f_reset_bins(binsCount) =>
+    array.clear(volBins)
+    array.clear(priceBins)
+    for i = 0 to binsCount - 1
+        array.push(volBins, 0.0)
+        array.push(priceBins, 0.0)
+
+// Build profile using local copies (no mutable args)
+f_build_profile(lb, binsCount) =>
+    lbLocal    = math.max(1, lb)
+    binsLocal  = math.max(1, binsCount)
+    _lo = ta.lowest(low, lbLocal)
+    _hi = ta.highest(high, lbLocal)
+    _range = math.max(1e-6, _hi - _lo)
+    _step  = _range / binsLocal
+
+    f_reset_bins(binsLocal)
+
+    // accumulate volume into bins using historic indexing
+    for j = 0 to lbLocal - 1
+        _p = close[j]
+        _v = volume[j]
+        if not na(_p) and not na(_v)
+            _idx = math.floor((_p - _lo) / _step)
+            _idx := math.min(math.max(_idx, 0), binsLocal - 1)
+            array.set(volBins, _idx, array.get(volBins, _idx) + _v)
+
+    // representative price (midpoint) for each bin
+    for k = 0 to binsLocal - 1
+        _pMid = _lo + (_step * k) + _step * 0.5
+        array.set(priceBins, k, _pMid)
+
+    [_lo, _hi, _step, binsLocal]
+
+// Build the profile and assign to previously-declared globals
+[_tempLo, _tempHi, _tempStep, _tempBins] = f_build_profile(lookbackBars, bins)
+compLo := _tempLo
+compHi := _tempHi
+binStep := _tempStep
+binsUsed := _tempBins
+
+// ====================== POC / LVN extraction (typed locals) ======================
+f_stats_poc_lvn() =>
+    if binsUsed == 0
+        // nothing to compute yet
+        return [na, na, na, na]
+
+    // typed locals
+    float _maxVol = 0.0
+    int   _pocIdx  = 0
+    float _sum    = 0.0
+
+    for i = 0 to binsUsed - 1
+        float _v = array.get(volBins, i)
+        _sum += _v
+        if _v > _maxVol
+            _maxVol := _v
+            _pocIdx := i
+
+    float _avgBinVol = _sum / math.max(1, binsUsed)
+    float _th = minBandPct * _avgBinVol
+
+    // explicitly typed NA-initialized variables
+    float _lvnBelow = na
+    float _lvnAbove = na
+
+    // search nearest LVN below (iterate downward safely)
+    if _pocIdx > 0
+        for i = _pocIdx - 1 to 0 by -1
+            // safe because i will be in [0..binsUsed-1]
+            if array.get(volBins, i) < _th
+                _lvnBelow := array.get(priceBins, i)
+                break
+
+    // search nearest LVN above
+    if _pocIdx < binsUsed - 1
+        for i = _pocIdx + 1 to binsUsed - 1
+            if array.get(volBins, i) < _th
+                _lvnAbove := array.get(priceBins, i)
+                break
+
+    float _pocPrice = array.get(priceBins, _pocIdx)
+    [_pocPrice, _lvnBelow, _lvnAbove, _avgBinVol]
+
+[poc, lvnBelow, lvnAbove, avgBinVol] = f_stats_poc_lvn()
+
+// Fallback LVNs if not found
+lvnBelow := na(lvnBelow) ? poc - binStep : lvnBelow
+lvnAbove := na(lvnAbove) ? poc + binStep : lvnAbove
+
+// ====================== Plotting ======================
+var line linePOC = na
+var line lineLVN1 = na
+var line lineLVN2 = na
+
+if showProfileLines and barstate.islast
+    if not na(linePOC)
+        line.delete(linePOC)
+    if not na(lineLVN1)
+        line.delete(lineLVN1)
+    if not na(lineLVN2)
+        line.delete(lineLVN2)
+    if not na(poc)
+        linePOC := line.new(bar_index - 1, poc, bar_index, poc, extend=extend.right, color=clrPOC, width=2)
+    if not na(lvnBelow)
+        lineLVN1 := line.new(bar_index - 1, lvnBelow, bar_index, lvnBelow, extend=extend.right, color=clrLVN, width=1)
+    if not na(lvnAbove)
+        lineLVN2 := line.new(bar_index - 1, lvnAbove, bar_index, lvnAbove, extend=extend.right, color=clrLVN, width=1)
+
+plot(compHi, display=display.none)
+plot(compLo, display=display.none)
+fill(plot(compHi, display=display.none), plot(compLo, display=display.none), color=clrBand)
+
+// ====================== Entry Logic ======================
+volOK = volume > ta.sma(volume, volFilterLen)
+
+longBreak   = not na(lvnAbove) and ta.crossover(close, lvnAbove) and volOK
+shortBreak  = not na(lvnBelow) and ta.crossunder(close, lvnBelow) and volOK
+longRevert  = not na(poc) and ta.crossover(close, poc) and close[1] < poc and volOK
+shortRevert = not na(poc) and ta.crossunder(close, poc) and close[1] > poc and volOK
+
+enterLong  = (tradeSide != "Short Only") and (longBreak or longRevert)
+enterShort = (tradeSide != "Long Only")  and (shortBreak or shortRevert)
+
+// ====================== Position Sizing (typed to allow NA) ======================
+float equity      = strategy.equity
+float riskAmt     = equity * (riskPerTrade/100.0)
+float tickValue   = syminfo.mintick
+float pocBuf      = slBufferTicks * tickValue
+
+// explicitly typed SL variables
+float longSL = na
+float shortSL = na
+longSL := na(poc) ? na : poc - pocBuf
+shortSL := na(poc) ? na : poc + pocBuf
+
+float longEntryPrice  = close
+float shortEntryPrice = close
+
+// explicitly typed risk variables
+float longRisk = na
+float shortRisk = na
+longRisk := na(longSL) ? na : math.max(tickValue, longEntryPrice - longSL)
+shortRisk := na(shortSL) ? na : math.max(tickValue, shortSL - shortEntryPrice)
+
+// qty helper
+f_qty_from_risk(_riskAmt, _riskDist) =>
+    _riskDist == 0 or na(_riskDist) ? 0.0 : (_riskAmt / _riskDist)
+
+float longQty  = f_qty_from_risk(riskAmt, longRisk)
+float shortQty = f_qty_from_risk(riskAmt, shortRisk)
+
+// TP variables (typed)
+float longTP = na
+float shortTP = na
+longTP := na(longRisk) ? na : longEntryPrice + (longRisk * tpRR)
+shortTP := na(shortRisk) ? na : shortEntryPrice - (shortRisk * tpRR)
+
+// --- Profit potential filter (10% minimum for longs by default) ---
+// Compute AFTER longTP is defined so 'longTP' exists
+bool profitPotentialLong = not na(longTP) and ((longTP - longEntryPrice) / longEntryPrice) >= (profitThresholdPct / 100.0)
+
+// ====================== Orders ======================
+if enterLong and strategy.position_size <= 0 and longQty > 0 and profitPotentialLong
+    strategy.entry("Long", strategy.long, qty=longQty)
+    if not na(longSL) and not na(longTP)
+        strategy.exit("L-Exit", from_entry="Long", stop=longSL, limit=longTP)
+
+if enterShort and strategy.position_size >= 0 and shortQty > 0
+    strategy.entry("Short", strategy.short, qty=shortQty)
+    if not na(shortSL) and not na(shortTP)
+        strategy.exit("S-Exit", from_entry="Short", stop=shortSL, limit=shortTP)
+
+// Optional ATR trailing (uses typed vars)
+atr = ta.atr(atrLen)
+if useATRtrail and strategy.position_size != 0
+    if strategy.position_size > 0
+        trailStop = math.max(longSL, close - atrMult*atr)
+        strategy.exit("L-Exit-ATR", from_entry="Long", stop=trailStop, limit=na)
+    if strategy.position_size < 0
+        trailStop = math.min(shortSL, close + atrMult*atr)
+        strategy.exit("S-Exit-ATR", from_entry="Short", stop=trailStop, limit=na)
